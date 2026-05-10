@@ -1,0 +1,11 @@
+.env
+chroma_db/
+bm25_index.pkl
+mtsamples.csv
+rag_logs.db
+conversations.db
+app.log
+archive.zip
+*.pkl
+*.db
+*.zip
