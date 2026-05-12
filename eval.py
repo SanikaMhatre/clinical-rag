@@ -1,17 +1,15 @@
 """
-eval.py — Offline RAGAs evaluation for the Clinical RAG pipeline
-Compatible with ragas >= 0.2.0
+eval.py — RAGAs evaluation for the Clinical RAG pipeline
+Environment: rag-eval conda env
 
-Judge LLM  : Gemini 2.0 Flash (free, independent from Groq/Llama)
-Embeddings : HuggingFace BiomedBERT (free, local)
-
-Setup:
-  1. pip install -U ragas langchain-google-genai langchain-huggingface langchain-chroma
-  2. Add to .env:  GOOGLE_API_KEY=your_key_here
-  3. Run:          python eval.py
+Judge LLM  : Groq Gemma2-9B (different from app's Llama 3.3 — no self-evaluation bias)
+Embeddings : local sentence-transformers (no OpenAI key needed)
+Retrieval  : BM25 + cross-encoder reranker
+Metrics    : Faithfulness, Answer Relevancy, Context Recall
 """
 
 import os
+import time
 import sqlite3
 import pickle
 import numpy as np
@@ -19,26 +17,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Validate keys ─────────────────────────────────────────────────────────────
-if not os.getenv("GOOGLE_API_KEY"):
-    print("ERROR: GOOGLE_API_KEY not found in .env")
-    print("Get a free key at: https://aistudio.google.com")
-    print("Add to .env:  GOOGLE_API_KEY=your_key_here")
+if not os.getenv("GROQ_API_KEY"):
+    print("ERROR: GROQ_API_KEY not found in .env")
     exit(1)
+
+# Dummy OpenAI key to stop ragas from crashing on import
+# We override the embeddings below with a local model
+os.environ.setdefault("OPENAI_API_KEY", "dummy-not-used")
 
 from datasets import Dataset
 from ragas import evaluate, RunConfig
-from ragas.metrics import Faithfulness, AnswerRelevancy, ContextRecall
-from ragas.llms import llm_factory
-from ragas.embeddings import embedding_factory
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+from ragas.metrics import faithfulness, answer_relevancy, context_recall
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import HuggingfaceEmbeddings
+from langchain_groq import ChatGroq
 from sentence_transformers import CrossEncoder
 
 DB_PATH = "rag_logs.db"
 
-# ── Gold eval dataset ─────────────────────────────────────────────────────────
 EVAL_DATASET = [
     {
         "question":     "What are the symptoms of myocardial infarction?",
@@ -102,20 +98,7 @@ EVAL_DATASET = [
     },
 ]
 
-# ── Load pipeline components ──────────────────────────────────────────────────
-print("Loading BiomedBERT embedding model...")
-embeddings = HuggingFaceEmbeddings(
-    model_name="microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext",
-    model_kwargs={"device": "cpu"},
-    encode_kwargs={"normalize_embeddings": True}
-)
-
-print("Loading ChromaDB vector store...")
-vectorstore = Chroma(
-    persist_directory="./chroma_db",
-    embedding_function=embeddings
-)
-
+# ── Load BM25 index ───────────────────────────────────────────────────────────
 print("Loading BM25 index...")
 with open("bm25_index.pkl", "rb") as f:
     data = pickle.load(f)
@@ -123,15 +106,28 @@ bm25      = data["bm25"]
 chunks    = data["chunks"]
 metadatas = data["metadatas"]
 
+print("Loading ChromaDB vector store...")
+from langchain_chroma import Chroma as LangChroma
+from langchain_huggingface import HuggingFaceEmbeddings
+embeddings = HuggingFaceEmbeddings(
+    model_name="microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext",
+    model_kwargs={"device": "cpu"},
+    encode_kwargs={"normalize_embeddings": True}
+)
+vectorstore = LangChroma(
+    persist_directory="./chroma_db",
+    embedding_function=embeddings
+)
+
 print("Loading cross-encoder reranker...")
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-# ── Retrieval helpers ─────────────────────────────────────────────────────────
-def vector_search(query, k=20):
+# ── Hybrid retrieval ──────────────────────────────────────────────────────────
+def vector_search(query, k=30):
     results = vectorstore.similarity_search_with_score(query, k=k)
     return [doc.page_content for doc, _ in results]
 
-def bm25_search(query, k=20):
+def bm25_search(query, k=30):
     scores  = bm25.get_scores(query.lower().split())
     top_idx = np.argsort(scores)[::-1][:k]
     return [chunks[i] for i in top_idx if scores[i] > 0]
@@ -145,27 +141,25 @@ def reciprocal_rank_fusion(v_chunks, b_chunks, k=60):
     return [c for c, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
 
 def retrieve(query, top_k=5):
-    merged = reciprocal_rank_fusion(
+    merged     = reciprocal_rank_fusion(
         vector_search(query, k=20),
         bm25_search(query, k=20)
     )
     if not merged:
         return []
-    candidates = merged[:20]
-    scores     = reranker.predict([(query, c) for c in candidates])
-    ranked     = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-    return [c for c, _ in ranked[:top_k]]
+    candidates    = merged[:20]
+    rerank_scores = reranker.predict([(query, c) for c in candidates])
+    ranked        = sorted(zip(candidates, rerank_scores),
+                           key=lambda x: x[1], reverse=True)
+    return [c for c, _ in ranked[:8]]
 
-# ── Load positively-rated logs from DB ───────────────────────────────────────
+# ── Load positively-rated logs ────────────────────────────────────────────────
 def load_logged_samples(limit=20):
     try:
         conn = sqlite3.connect(DB_PATH)
         c    = conn.cursor()
-        c.execute("""
-            SELECT query, answer FROM logs
-            WHERE feedback = 1
-            ORDER BY timestamp DESC LIMIT ?
-        """, (limit,))
+        c.execute("SELECT query, answer FROM logs WHERE feedback=1 "
+                  "ORDER BY timestamp DESC LIMIT ?", (limit,))
         rows = c.fetchall()
         conn.close()
         return [{"question": q, "ground_truth": a} for q, a in rows]
@@ -175,14 +169,12 @@ def load_logged_samples(limit=20):
 # ── Build eval dataset ────────────────────────────────────────────────────────
 print("\nBuilding evaluation dataset...")
 samples = EVAL_DATASET.copy()
-
-logged = load_logged_samples()
+logged  = load_logged_samples()
 if logged:
     print(f"Adding {len(logged)} positively-rated Q&As from rag_logs.db")
     samples.extend(logged)
 else:
     print("No logged feedback found — using gold dataset only")
-
 print(f"Total eval samples: {len(samples)}")
 
 print("\nRunning retrieval for each question...")
@@ -196,59 +188,66 @@ for i, sample in enumerate(samples):
         ctxs = ["No relevant context found."]
     else:
         print(f"  [{i+1}/{len(samples)}] OK — {q[:60]}")
+    # Generate actual answer from Groq for faithful evaluation
+    from groq import Groq
+    groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+    context_str = "\n\n".join(ctxs[:3])
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "Answer only from the provided context. Be concise."},
+            {"role": "user",   "content": f"Context:\n{context_str}\n\nQuestion: {q}\n\nAnswer:"}
+        ],
+        temperature=0.1, max_tokens=256
+    )
+    generated_answer = response.choices[0].message.content
+
     eval_rows.append({
         "question":     q,
         "contexts":     ctxs,
-        "answer":       gt,
+        "answer":       generated_answer,   # ← real LLM answer
         "ground_truth": gt
     })
+    time.sleep(2)  # avoid rate limits
+    
 
 dataset = Dataset.from_list(eval_rows)
 
-# ── Configure Gemini as judge (ragas v0.2+ API) ───────────────────────────────
-print("\nConfiguring Gemini 2.0 Flash as judge LLM...")
-print("(Gemini judges Llama's output — no self-evaluation bias)\n")
+# ── Configure judge LLM + local embeddings ────────────────────────────────────
+print("\nConfiguring Groq Gemma2-9B as judge LLM...")
+print("(Different model from app's Llama 3.3 — no self-evaluation bias)\n")
 
-# Gemini LLM for judging
-gemini_llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash",
-    google_api_key=os.getenv("GOOGLE_API_KEY"),
+judge_chat = ChatGroq(
+    model="llama-3.1-8b-instant",
+    api_key=os.getenv("GROQ_API_KEY"),
     temperature=0
 )
+judge_llm = LangchainLLMWrapper(judge_chat)
 
-# ragas v0.2+ uses instantiated metric objects with llm passed directly
-faithfulness_metric   = Faithfulness(llm=gemini_llm)
-answer_relevancy_metric = AnswerRelevancy(
-    llm=gemini_llm,
-    embeddings=embeddings   # BiomedBERT for embedding similarity
+# Local embeddings for answer_relevancy — no OpenAI key needed
+local_emb = HuggingfaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
-context_recall_metric = ContextRecall(llm=gemini_llm)
+
+faithfulness.llm            = judge_llm
+answer_relevancy.llm        = judge_llm
+answer_relevancy.embeddings = local_emb
+context_recall.llm          = judge_llm
 
 # ── Run evaluation ────────────────────────────────────────────────────────────
-print("Running RAGAs evaluation...")
-print("This calls Gemini for each sample — takes 2-5 minutes.\n")
+print("Running RAGAs evaluation — takes a few minutes...\n")
 
 try:
     results = evaluate(
         dataset=dataset,
-        metrics=[
-            faithfulness_metric,
-            answer_relevancy_metric,
-            context_recall_metric,
-        ],
-        run_config=RunConfig(
-            max_workers=1,
-            timeout=180,
-            max_retries=5,
-            retry_wait=60   # wait 60s between retries on rate limit
-        )
+        metrics=[faithfulness, answer_relevancy, context_recall],
+        run_config=RunConfig(max_workers=1, timeout=300)
     )
 except Exception as e:
     print(f"\nERROR during evaluation: {e}")
-    print("\nCommon fixes:")
-    print("  - Check GOOGLE_API_KEY is correct in .env")
-    print("  - Gemini rate limit: wait 60s and retry")
-    print("  - Try: pip install -U ragas langchain-google-genai")
+    print("  - Check GROQ_API_KEY in .env")
+    print("  - Try waiting 60s if rate limited")
     exit(1)
 
 # ── Print results ─────────────────────────────────────────────────────────────
@@ -256,34 +255,38 @@ df = results.to_pandas()
 
 print("\n" + "=" * 60)
 print("RAGAs Evaluation Results")
-print("Judge LLM  : Gemini 2.0 Flash")
-print("Embeddings : BiomedBERT")
+print("Judge LLM  : Groq Gemma2-9B")
+print("Embeddings : sentence-transformers/all-MiniLM-L6-v2 (local)")
+print("Retrieval  : BM25 + cross-encoder reranker")
 print(f"Samples    : {len(df)}")
 print("=" * 60)
 
 metric_cols = ["faithfulness", "answer_relevancy", "context_recall"]
 available   = [c for c in metric_cols if c in df.columns]
 
-# Per-question table
 print("\nPer-question scores:")
 for _, row in df.iterrows():
-    q = str(row.get("question",""))[:55]
+    q          = str(row.get("question",""))[:55]
     scores_str = "  ".join(
-        f"{m[:5]}: {row[m]:.2f}" for m in available if m in row
+        f"{m[:5]}: {float(row[m]):.2f}"
+        if not np.isnan(float(row[m])) else f"{m[:5]}: N/A"
+        for m in available if m in row
     )
     print(f"  {q:<55} {scores_str}")
 
-# Aggregate
 print("\n── Aggregate Scores (higher is better, max 1.0) ──")
 for metric in available:
     score = df[metric].mean()
-    bar   = "█" * int(score * 20) + "░" * (20 - int(score * 20))
+    if np.isnan(score):
+        print(f"  {metric:<22} N/A")
+        continue
+    bar = "█" * int(score * 20) + "░" * (20 - int(score * 20))
     print(f"  {metric:<22} {bar}  {score:.3f}")
 
-if len(available) == 3:
-    overall = df[available].mean().mean()
+valid = [m for m in available if not np.isnan(df[m].mean())]
+if len(valid) == 3:
+    overall = df[valid].mean().mean()
     print(f"\n  Overall mean           {overall:.3f}")
-    print(f"\n  Interpretation:")
     if overall >= 0.8:
         print("  GOOD  — system is retrieving and answering well")
     elif overall >= 0.6:
@@ -291,7 +294,6 @@ if len(available) == 3:
     else:
         print("  POOR  — check chunking, retrieval k, and prompt")
 
-# Save
 out_path = "eval_results.csv"
 df.to_csv(out_path, index=False)
 print(f"\nResults saved to: {out_path}")

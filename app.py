@@ -401,17 +401,22 @@ SYSTEM_PROMPT = """You are a clinical knowledge assistant helping healthcare pro
 You are given excerpts from real medical transcription records as context.
 
 STRICT RULES:
-- Extract and present GENERAL CLINICAL KNOWLEDGE — symptoms, treatments, medications,
-  procedures, diagnostic criteria.
-- NEVER describe specific patients or individuals. Do not say "the patient", "a patient",
-  "she", "he", or describe personal cases.
-- Transform patient-specific text into general facts.
-  Example: "patient presented with crushing chest pain" → "Symptoms include crushing chest pain"
+- Answer ONLY using information explicitly stated in the provided context.
+- Do NOT synthesize, infer, assume, or use any outside knowledge whatsoever.
+- Do NOT say things like "it is implied" or "it can be inferred" — only state what
+  is directly written in the context.
+- If the context contains partial information, use what is available and note it
+  may be incomplete. Only respond with "I cannot find sufficient information"
+  if the context is completely unrelated to the question.
+- Do NOT describe specific patients or individuals. Do not say "the patient", "a patient",
+  "she", "he", or refer to personal cases.
+- Transform any patient-specific text into general clinical facts only if the fact
+  is explicitly stated — not inferred.
+  Example: "patient presented with crushing chest pain" →
+  "Crushing chest pain is documented as a presentation."
 - Write in clean natural prose. Do not mention chunk numbers.
-- Use conversation history to resolve follow-up pronouns like "it", "that condition".
-- If long term memory is provided, use it for consistency.
-- If context does not directly answer, synthesize what is implied and note it.
-- Only say "I cannot find information" if context is completely unrelated.
+- Use conversation history only to resolve pronouns like "it" or "that condition"
+  — do not use it to add information not in the current context.
 - Be concise and precise. Never fabricate information."""
 
 def build_messages(query, context_chunks, short_term, long_term, session_history=None):
@@ -533,7 +538,7 @@ def switch_conversation(conv_id):
     st.session_state.editing_text     = None
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
-page = st.sidebar.radio("Navigation", ["Chat","Review dashboard"],
+page = st.sidebar.radio("Navigation", ["Chat","Review dashboard","Eval dashboard"],
                          label_visibility="collapsed")
 
 with st.sidebar:
@@ -832,7 +837,7 @@ if page == "Chat":
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE 2 — Review dashboard
 # ══════════════════════════════════════════════════════════════════════════════
-else:
+elif page == "Review dashboard":
     st.title("Review dashboard")
     st.caption("All logged queries, answers, latency, and feedback.")
 
@@ -879,3 +884,99 @@ else:
             st.markdown(f"**Top rerank score:** {log['top_rerank_score'] or 0:.3f}")
             if log.get("correction"):
                 st.markdown(f"**User correction:** {log['correction']}")
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 3 — Eval dashboard
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Eval dashboard":
+    import pandas as pd
+    import json
+
+    st.title("Eval dashboard")
+    st.caption("RAGAs evaluation results — Faithfulness, Answer Relevancy, Context Recall")
+
+    csv_path = "eval_results.csv"
+    if not os.path.exists(csv_path):
+        st.info("No eval results found. Run eval.py first to generate eval_results.csv")
+        st.code("conda activate rag-eval\npython eval.py")
+        st.stop()
+
+    df = pd.read_csv(csv_path)
+
+    metric_cols = [c for c in ["faithfulness","answer_relevancy","context_recall"]
+                   if c in df.columns]
+
+    if not metric_cols:
+        st.error("No metric columns found in eval_results.csv")
+        st.stop()
+
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    cols = st.columns(len(metric_cols))
+    for col, metric in zip(cols, metric_cols):
+        score = df[metric].mean()
+        label = metric.replace("_", " ").title()
+        delta_color = "normal"
+        if score >= 0.8:
+            delta = "Good"
+        elif score >= 0.6:
+            delta = "OK"
+        else:
+            delta = "Needs work"
+        col.metric(label, f"{score:.3f}", delta)
+
+    st.divider()
+
+    # ── Bar chart — per question ──────────────────────────────────────────────
+    st.subheader("Per-question scores")
+
+    chart_df = df[["question"] + metric_cols].copy()
+    chart_df["question"] = chart_df["question"].str[:50]
+    chart_df = chart_df.set_index("question")
+
+    st.bar_chart(chart_df)
+
+    # ── Aggregate score bars ──────────────────────────────────────────────────
+    st.subheader("Aggregate scores")
+
+    for metric in metric_cols:
+        score = df[metric].mean()
+        label = metric.replace("_", " ").title()
+        if score >= 0.8:
+            color = "green"
+        elif score >= 0.6:
+            color = "orange"
+        else:
+            color = "red"
+        filled   = int(score * 20)
+        empty    = 20 - filled
+        bar      = "█" * filled + "░" * empty
+        st.markdown(f"**{label}** `{bar}` **{score:.3f}**")
+
+    # ── Worst performing questions ────────────────────────────────────────────
+    st.divider()
+    st.subheader("Lowest scoring questions")
+    st.caption("Questions where at least one metric scored below 0.6")
+
+    df["avg_score"] = df[metric_cols].mean(axis=1)
+    weak = df[df["avg_score"] < 0.6].sort_values("avg_score")
+
+    if weak.empty:
+        st.success("All questions scored above 0.6 average — system is performing well.")
+    else:
+        for _, row in weak.iterrows():
+            with st.expander(f"{row['question'][:80]} — avg: {row['avg_score']:.3f}"):
+                for metric in metric_cols:
+                    score = row[metric]
+                    st.markdown(f"**{metric}:** {score:.3f}")
+
+    # ── Raw table ─────────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("Full results table")
+    display_cols = ["question"] + metric_cols + ["avg_score"]
+    st.dataframe(
+        df[display_cols].style.format(
+            {m: "{:.3f}" for m in metric_cols + ["avg_score"]}
+        ).background_gradient(
+            subset=metric_cols, cmap="RdYlGn", vmin=0, vmax=1
+        ),
+        use_container_width=True
+    )
