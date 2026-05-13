@@ -11,37 +11,53 @@ Healthcare professionals often need to quickly query clinical knowledge across s
 - **Hybrid RAG** — BiomedBERT dense retrieval + BM25 keyword search merged via Reciprocal Rank Fusion
 - **Cross-encoder reranking** — MiniLM reranker selects the most relevant chunks before generation
 - **PII redaction** — Microsoft Presidio anonymizes names, dates, and locations at ingestion
+- **Section-aware chunking** — splits clinical notes on section headers (HPI, Assessment, Plan) for coherent chunks
 - **Specialty-aware retrieval** — auto-detects medical specialty from query and filters chunks accordingly
-- **Conversational memory** — short-term (session) and long-term (cross-session) memory
+- **Conversational memory** — short-term (session) and long-term (cross-session) memory via embedding similarity
 - **HITL feedback** — thumbs up/down with correction input, stored to SQLite
+- **Chat editing** — edit any past message and re-run the pipeline from that point
+- **Conversation history** — saved conversations in sidebar like Claude/ChatGPT
 - **Observability** — per-step latency logging, LangSmith tracing, review dashboard
-- **Evaluation** — RAGAs metrics (faithfulness, answer relevancy, context recall) with Gemini as independent judge
+- **Evaluation** — RAGAs metrics (faithfulness, answer relevancy, context recall) with independent judge LLM
+
+## Evaluation Results
+
+Evaluated using RAGAs with Groq Gemma2-9B as independent judge LLM (different model from app's Llama 3.3 70B — eliminates self-evaluation bias):
+
+| Metric | Score | Description |
+|---|---|---|
+| Faithfulness | 0.667 | Answer stays within retrieved context |
+| Answer Relevancy | 0.574 | Answer directly addresses the question |
+| Context Recall | 0.725 | Retrieval finds the right chunks |
+| **Overall** | **0.655** | |
 
 ## Tech Stack
 
-| Component | Tool |
-|---|---|
-| Embedding | BiomedBERT (HuggingFace) |
-| Vector store | ChromaDB |
-| Keyword search | BM25 (rank-bm25) |
-| Reranker | cross-encoder/ms-marco-MiniLM-L-6-v2 |
-| LLM | Groq Llama 3.3 70B |
-| PII redaction | Microsoft Presidio |
-| Evaluation | RAGAs + Gemini 1.5 Flash |
-| Observability | LangSmith |
-| UI | Streamlit |
+| Component | Tool | Version |
+|---|---|---|
+| Embedding | BiomedBERT (HuggingFace) | microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext |
+| Vector store | ChromaDB | 0.5.20 |
+| Keyword search | BM25 | rank-bm25 0.2.2 |
+| Reranker | MiniLM cross-encoder | cross-encoder/ms-marco-MiniLM-L-6-v2 |
+| LLM (generation) | Groq Llama 3.3 70B | groq 0.37.1 |
+| LLM (eval judge) | Groq Gemma2-9B | independent model |
+| PII redaction | Microsoft Presidio | 2.2.362 |
+| Evaluation | RAGAs | 0.1.21 |
+| Observability | LangSmith | 0.1.147 |
+| UI | Streamlit | 1.57.0 |
+| Orchestration | LangChain | 0.1.20 |
 
 ## Dataset
 
 - **MTSamples** — 5,000+ medical transcriptions across 40+ specialties ([Kaggle](https://www.kaggle.com/datasets/tboyle10/medicaltranscriptions))
-- **MIMIC-IV-Note** (optional upgrade) — 2M+ real clinical notes, requires PhysioNet access
+- **MIMIC-IV-Note** (optional upgrade) — 2M+ real clinical notes, requires PhysioNet credentialing at physionet.org
 
 ## Project Structure
 
 ```
 clinical-rag/
 ├── ingest.py          # Data loading, PII redaction, chunking, embedding, indexing
-├── app.py             # Streamlit UI — chat, HITL feedback, review dashboard
+├── app.py             # Streamlit UI — chat, HITL, review dashboard, eval dashboard
 ├── rag.py             # CLI query pipeline
 ├── eval.py            # RAGAs evaluation script
 ├── .streamlit/
@@ -61,8 +77,8 @@ cd clinical-rag
 
 **2. Create conda environment:**
 ```bash
-conda create -n clinical-rag python=3.11
-conda activate clinical-rag
+conda create -n rag-eval python=3.11 --no-default-packages -y
+conda activate rag-eval
 pip install -r requirements.txt
 python -m spacy download en_core_web_lg
 ```
@@ -73,7 +89,6 @@ GROQ_API_KEY=your_groq_key_here
 LANGCHAIN_TRACING_V2=true
 LANGCHAIN_API_KEY=your_langsmith_key_here
 LANGCHAIN_PROJECT=clinical-rag
-GOOGLE_API_KEY=your_gemini_key_here
 ```
 
 **4. Download the dataset:**
@@ -87,7 +102,7 @@ python ingest.py
 
 **6. Run the app:**
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 **7. Run evaluation (optional):**
@@ -99,18 +114,12 @@ python eval.py
 
 | Service | Link | Notes |
 |---|---|---|
-| Groq | [console.groq.com](https://console.groq.com) | Free, no credit card |
+| Groq | [console.groq.com](https://console.groq.com) | Free, no credit card needed |
 | LangSmith | [smith.langchain.com](https://smith.langchain.com) | Free tier, 5000 traces/month |
-| Gemini | [aistudio.google.com](https://aistudio.google.com) | Free tier, for eval only |
 
-## Evaluation
+## Important Notes
 
-RAGAs metrics scored with Gemini 1.5 Flash as independent judge (eliminates self-evaluation bias from using the same LLM for generation and judging):
-
-| Metric | Description |
-|---|---|
-| Faithfulness | Does the answer stick to the retrieved context? |
-| Answer Relevancy | Does the answer address the question? |
-| Context Recall | Did retrieval find the right chunks? |
-
-Results saved to `eval_results.csv` after each run.
+- **Package versions are pinned** — ragas 0.1.21 requires specific langchain-core and pydantic versions. Do not upgrade these without testing.
+- **Run order** — `ingest.py` must complete before running `app.py` or `eval.py`
+- **Eval environment** — use the same `rag-eval` conda environment for both app and eval
+- **ChromaDB** — the `chroma_db/` folder is gitignored. Each user must run `ingest.py` to generate it locally.
